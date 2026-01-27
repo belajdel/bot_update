@@ -24,14 +24,12 @@ const DATA_DIR = path.join(__dirname, 'data');
 const LAST_POST_FILE = path.join(DATA_DIR, 'last-post.json');
 
 // In-memory state
-let lastPostData = {
-    lastPostUrl: '',
+let state = {
     lastCheckTime: '',
-    lastPostTime: '',
-    lastPostContent: ''
+    posts: [] // Array of { url, time, content, image, isPublished }
 };
 
-// Initialize data directory and load last post
+// Initialize data directory and load state
 async function initializeData() {
     try {
         await fs.mkdir(DATA_DIR, { recursive: true });
@@ -39,23 +37,39 @@ async function initializeData() {
         try {
             const data = await fs.readFile(LAST_POST_FILE, 'utf-8');
             const parsed = JSON.parse(data);
-            lastPostData = { ...lastPostData, ...parsed };
-            console.log('✅ Loaded last post data from file');
+
+            // Migration/Compatibility check
+            if (parsed.lastPostUrl && !parsed.posts) {
+                state.posts = [{
+                    url: parsed.lastPostUrl,
+                    time: parsed.lastPostTime,
+                    content: parsed.lastPostContent,
+                    isPublished: true
+                }];
+                state.lastCheckTime = parsed.lastCheckTime;
+            } else {
+                state = { ...state, ...parsed };
+            }
+            console.log('✅ Loaded state from file');
         } catch (error) {
-            console.log('📝 No previous post data found or file empty, starting fresh');
-            await saveLastPost();
+            console.log('📝 No previous state found or file empty, starting fresh');
+            await saveState();
         }
     } catch (error) {
         console.error('Error initializing data:', error);
     }
 }
 
-// Save last post data
-async function saveLastPost() {
+// Save state data
+async function saveState() {
     try {
-        await fs.writeFile(LAST_POST_FILE, JSON.stringify(lastPostData, null, 2));
+        // Keep only last 20 posts to prevent file bloat
+        if (state.posts.length > 20) {
+            state.posts = state.posts.slice(0, 20);
+        }
+        await fs.writeFile(LAST_POST_FILE, JSON.stringify(state, null, 2));
     } catch (error) {
-        console.error('Error saving last post:', error);
+        console.error('Error saving state:', error);
     }
 }
 
@@ -213,42 +227,51 @@ async function scrapePosts() {
 // Check for new posts and send to Discord
 async function checkForNewPosts() {
     console.log('🔄 Checking for new posts...');
-    lastPostData.lastCheckTime = new Date().toISOString();
+    state.lastCheckTime = new Date().toISOString();
 
     const fetchedPosts = await scrapePosts();
 
     if (fetchedPosts.length === 0) {
         console.log('⚠️  Failed to scrape or no posts found');
-        await saveLastPost();
+        await saveState();
         return { success: false, message: 'No posts found' };
     }
 
-    // Reverse to process oldest first to maintain chronological order in Discord
-    const newPosts = [];
-    const lastUrl = lastPostData.lastPostUrl;
+    // Identify new posts
+    const existingUrls = new Set(state.posts.map(p => p.url));
+    const newPostsScraped = fetchedPosts.filter(p => !existingUrls.has(p.url));
 
-    for (const post of fetchedPosts) {
-        if (post.url === lastUrl) break;
-        newPosts.push(post);
+    if (newPostsScraped.length > 0) {
+        console.log(`🆕 ${newPostsScraped.length} new post(s) detected!`);
+        // Add new posts to the start of our tracking list
+        const preparedPosts = newPostsScraped.map(p => ({
+            url: p.url,
+            time: p.timestamp,
+            content: p.content,
+            image: p.image,
+            isPublished: false
+        }));
+        state.posts = [...preparedPosts, ...state.posts];
     }
 
-    // Reverse back so we post in order
-    newPosts.reverse();
+    // Process all unpublished posts
+    const unpublishedPosts = state.posts.filter(p => p.isPublished === false);
 
-    if (newPosts.length === 0) {
-        console.log('ℹ️  No new posts found');
-        await saveLastPost();
-        return { success: true, message: 'No new posts', isNew: false };
+    if (unpublishedPosts.length === 0) {
+        console.log('ℹ️  No pending posts to publish');
+        await saveState();
+        return { success: true, message: 'No new posts to publish', isNew: false };
     }
 
-    console.log(`🆕 ${newPosts.length} new post(s) detected!`);
+    console.log(`📤 Attempting to publish ${unpublishedPosts.length} post(s)...`);
 
     let sentCount = 0;
-    for (const post of newPosts) {
-        // Update state with the absolute latest as we go
-        lastPostData.lastPostUrl = post.url;
-        lastPostData.lastPostTime = post.timestamp;
-        lastPostData.lastPostContent = post.content;
+    // Reverse unpublished posts to post oldest first (chronological order)
+    const toPublish = [...unpublishedPosts].reverse();
+
+    for (const post of toPublish) {
+        // Find the index in the original state.posts array
+        const stateIdx = state.posts.findIndex(p => p.url === post.url);
 
         // Send to Discord
         if (discordPostUpdate) {
@@ -260,20 +283,31 @@ async function checkForNewPosts() {
                     image: post.image,
                     color: '#1877F2' // Facebook blue
                 });
+
+                // Mark as published in state
+                if (stateIdx !== -1) {
+                    state.posts[stateIdx].isPublished = true;
+                }
                 sentCount++;
+
+                // Save state after each successful post
+                await saveState();
+
                 // Small delay between posts to prevent rate limits
                 await new Promise(r => setTimeout(r, 2000));
             } catch (error) {
-                console.error('❌ Error posting to Discord:', error);
+                console.error(`❌ Error posting to Discord (${post.url}):`, error);
+                // We don't set isPublished to true, so it will be retried next time
             }
+        } else {
+            console.warn('⚠️ Discord post function not available');
         }
     }
 
-    await saveLastPost();
     return {
         success: sentCount > 0,
-        message: `Processed ${newPosts.length} posts, sent ${sentCount} successfully.`,
-        isNew: true,
+        message: `Processed ${unpublishedPosts.length} pending posts, sent ${sentCount} successfully.`,
+        isNew: newPostsScraped.length > 0,
         count: sentCount
     };
 }
@@ -288,13 +322,16 @@ app.get('/health', (req, res) => {
 
 // Get status
 app.get('/api/status', (req, res) => {
+    const lastPost = state.posts[0] || {};
     res.json({
         status: 'running',
-        lastCheck: lastPostData.lastCheckTime,
+        lastCheck: state.lastCheckTime,
+        pendingPosts: state.posts.filter(p => !p.isPublished).length,
         lastPost: {
-            url: lastPostData.lastPostUrl,
-            time: lastPostData.lastPostTime,
-            preview: (lastPostData.lastPostContent || '').substring(0, 100)
+            url: lastPost.url,
+            time: lastPost.time,
+            isPublished: lastPost.isPublished,
+            preview: (lastPost.content || '').substring(0, 100)
         },
         checkInterval: `${CHECK_INTERVAL} minutes`,
         fbPageUrl: FB_PAGE_URL
