@@ -7,7 +7,7 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.API_PORT || 3000;
-const CHECK_INTERVAL = process.env.CHECK_INTERVAL || 10; // minutes
+const CHECK_INTERVAL = process.env.CHECK_INTERVAL || 2; // minutes
 const FB_PAGE_URL = process.env.FB_PAGE_URL || 'https://www.facebook.com/1GenerationZ';
 
 // Import Discord bot post function
